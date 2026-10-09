@@ -305,13 +305,28 @@ impl AccessKitAdapter {
         callback: impl FnOnce(&std::cell::RefCell<Self>, Weak<WinitWindowAdapter>) + 'static,
     ) {
         let win = self.window_adapter_weak.clone();
-        i_slint_core::timers::Timer::single_shot(Default::default(), move || {
+        i_slint_core::timers::Timer::single_shot(accessibility_update_delay(), move || {
             WinitWindowAdapter::with_access_kit_adapter_from_weak_window_adapter(
                 win.clone(),
                 move |self_cell| callback(self_cell, win),
             );
         });
     }
+}
+
+/// Accessibility tree updates are coalesced behind this delay instead of running on the next
+/// event-loop turn. During a 60 Hz scroll every frame destroys rows that left the viewport
+/// (full `reload_tree`) and moves every visible row (dirty-node rebuild); with a zero delay
+/// both ran, and raised UIA property-changed events, on every frame. Assistive clients do
+/// not consume updates at frame rate, and `reload_tree` already dedups through
+/// `pending_update`, so a short delay bounds the work to at most ~20 updates per second.
+/// Override with `SLINT_ACCESSKIT_UPDATE_DELAY_MS` for experiments (0 restores the old behavior).
+fn accessibility_update_delay() -> core::time::Duration {
+    static DELAY_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *DELAY_MS.get_or_init(|| {
+        std::env::var("SLINT_ACCESSKIT_UPDATE_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50)
+    });
+    core::time::Duration::from_millis(ms)
 }
 
 const NODE_ID_INDEX_BITS: u32 = 16;
@@ -963,7 +978,7 @@ struct AccessibilityPropertyDirtyHandler {
 impl i_slint_core::properties::PropertyDirtyHandler for AccessibilityPropertyDirtyHandler {
     fn notify(self: Pin<&Self>) {
         let win = self.window_adapter_weak.clone();
-        i_slint_core::timers::Timer::single_shot(Default::default(), move || {
+        i_slint_core::timers::Timer::single_shot(accessibility_update_delay(), move || {
             WinitWindowAdapter::with_access_kit_adapter_from_weak_window_adapter(
                 win,
                 |self_cell| {
