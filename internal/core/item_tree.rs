@@ -730,7 +730,7 @@ impl ItemRc {
     /// Returns an absolute position of `p` in the `ancestor`'s coordinate system
     /// (does not add this item's x and y)
     /// Don't rely on any specific behavior if `self` isn't a descendant of `ancestor`.
-    fn map_to_ancestor(&self, p: LogicalPoint, ancestor: &Self) -> LogicalPoint {
+    pub fn map_to_ancestor(&self, p: LogicalPoint, ancestor: &Self) -> LogicalPoint {
         self.map_to_item_tree_impl(p, |parent| parent == ancestor)
     }
 

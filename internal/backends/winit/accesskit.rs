@@ -1,13 +1,14 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Weak;
 
 use accesskit::{
-    Action, ActionRequest, Live, Node, NodeId, Orientation, Role, Toggled, Tree, TreeId, TreeUpdate,
+    Action, ActionRequest, Affine, Live, Node, NodeId, Orientation, Role, Toggled, Tree, TreeId,
+    TreeUpdate,
 };
 use i_slint_core::SharedString;
 use i_slint_core::accessibility::{
@@ -112,6 +113,7 @@ impl AccessKitAdapter {
                     self.nodes.build_new_tree(
                         &self.window_adapter_weak,
                         self.global_property_tracker.as_ref(),
+                        true,
                     )
                 });
                 self.initial_tree_sent = true;
@@ -215,7 +217,7 @@ impl AccessKitAdapter {
             let self_ = &mut *self_;
             self_.pending_update = false;
             self_.inner.update_if_active(|| {
-                self_.nodes.build_new_tree(&win, self_.global_property_tracker.as_ref())
+                self_.nodes.build_new_tree(&win, self_.global_property_tracker.as_ref(), false)
             })
         });
     }
@@ -244,51 +246,18 @@ impl AccessKitAdapter {
         }
 
         let Some(window_adapter) = self.window_adapter_weak.upgrade() else { return };
-        let window = window_adapter.window();
+        let scale_factor = ScaleFactor::new(window_adapter.window().scale_factor());
 
         self.inner.update_if_active(|| {
             self.global_property_tracker.as_ref().evaluate_as_dependency_root(|| {
-                let nodes_vec: Vec<(NodeId, Node)> = self
-                    .nodes
-                    .all_nodes
-                    .iter()
-                    .flat_map(|cached_node| {
-                        cached_node
-                            .tracker
-                            .as_ref()
-                            .evaluate_if_dirty(|| {
-                                let scale_factor = ScaleFactor::new(window.scale_factor());
-                                let Some(item) = self.nodes.item_rc_for_node_id(cached_node.id)
-                                else {
-                                    return Vec::new();
-                                };
-
-                                let mut node = self.nodes.build_node_without_children(
-                                    &item,
-                                    scale_factor,
-                                    Default::default(),
-                                );
-                                node.set_children(cached_node.children.clone());
-
-                                let mut emitted: Vec<(NodeId, Node)> = Vec::new();
-                                self.nodes.try_emit_text_input_accessibility(
-                                    &item,
-                                    &mut node,
-                                    cached_node.id,
-                                    scale_factor,
-                                    Default::default(),
-                                    &mut emitted,
-                                    &window_adapter,
-                                );
-
-                                let mut out = Vec::with_capacity(1 + emitted.len());
-                                out.push((cached_node.id, node));
-                                out.extend(emitted);
-                                out
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect();
+                let t0 = std::time::Instant::now();
+                let mut cached = std::mem::take(&mut self.nodes.all_nodes);
+                let mut nodes_vec: Vec<(NodeId, Node)> = Vec::new();
+                for c in cached.iter_mut() {
+                    self.nodes.refresh_cached_node(c, scale_factor, &window_adapter, &mut nodes_vec);
+                }
+                stat("dirty", nodes_vec.len(), cached.len(), t0.elapsed());
+                self.nodes.all_nodes = cached;
 
                 TreeUpdate {
                     nodes: nodes_vec,
@@ -382,7 +351,7 @@ fn wraps_text_input(role: Role) -> bool {
 
 struct NodeCollection {
     next_component_id: u32,
-    free_component_ids: Vec<u32>,
+    free_component_ids: VecDeque<u32>,
     components_by_id: HashMap<u32, ItemTreeWeak>,
     component_ids: HashMap<NonNull<u8>, u32>,
     all_nodes: Vec<CachedNode>,
@@ -444,17 +413,24 @@ impl NodeCollection {
     }
 
     fn alloc_component_id(&mut self) -> u32 {
-        self.free_component_ids.pop().unwrap_or_else(|| {
-            let id = self.next_component_id;
-            self.next_component_id += 1;
-            id
-        })
+        // Reusing an id right after it was freed makes AccessKit see a component created in
+        // this frame as an update of the one destroyed in the same frame (new name, new
+        // position in set), which raises a property-changed event per node: a ListView
+        // scroll produced dozens per frame. Keep freed ids parked until plenty of others
+        // have been freed, so a reused id has long been gone from the tree.
+        const PARKED_IDS: usize = 1024;
+        if self.free_component_ids.len() > PARKED_IDS {
+            return self.free_component_ids.pop_front().unwrap();
+        }
+        let id = self.next_component_id;
+        self.next_component_id += 1;
+        id
     }
 
     fn forget_component(&mut self, component_ptr: NonNull<u8>) {
         if let Some(component_id) = self.component_ids.remove(&component_ptr) {
             self.components_by_id.remove(&component_id);
-            self.free_component_ids.push(component_id);
+            self.free_component_ids.push_back(component_id);
         }
         self.text_state.component_destroyed_at(component_ptr);
     }
@@ -503,9 +479,13 @@ impl NodeCollection {
         scale_factor: ScaleFactor,
         window_position: LogicalPoint,
         window_adapter: &std::rc::Rc<WinitWindowAdapter>,
+        base: Option<NodeId>,
+        full: bool,
+        old: &mut HashMap<NodeId, CachedNode>,
     ) -> NodeId {
         let id = self.encode_item_node_id(&item);
 
+        // Popups are child windows at their own window position: never inside a content node.
         let popup_children = popups
             .iter()
             .filter_map(|popup| {
@@ -521,54 +501,265 @@ impl NodeCollection {
                     scale_factor,
                     popup.location,
                     window_adapter,
+                    None,
+                    full,
+                    old,
                 ))
             })
             .collect::<Vec<_>>();
 
-        let descendant_children = i_slint_core::accessibility::accessible_descendents(&item)
-            .map(|child| {
-                self.build_node_for_item_recursively(
-                    child,
-                    nodes,
-                    popups,
-                    scale_factor,
-                    window_position,
-                    window_adapter,
-                )
-            })
-            .chain(popup_children)
-            .collect::<Vec<NodeId>>();
+        // Accessible children that sit inside a Flickable (the ScrollView's Flickable is not
+        // itself accessible; the item with the list role is above it) go under a synthetic
+        // content node that carries the scroll offset as a transform. Their bounds are then
+        // relative to that node, so a scroll changes one node per Flickable instead of every
+        // visible row. Children are grouped by Flickable, in order of first appearance.
+        let mut groups: Vec<(Option<NodeId>, Vec<NodeId>)> = Vec::new();
+        for child in i_slint_core::accessibility::accessible_descendents(&item) {
+            let content_id = nearest_flickable_below(&child, &item)
+                .map(|flickable| encode_sub_node_id(self.encode_item_node_id(&flickable), FLICKABLE_CONTENT_SUB_INDEX));
+            let child_base = content_id.or(base);
+            let child_id = self.build_node_for_item_recursively(
+                child,
+                nodes,
+                popups,
+                scale_factor,
+                window_position,
+                window_adapter,
+                child_base,
+                full,
+                old,
+            );
+            match groups.iter_mut().find(|(c, _)| *c == content_id) {
+                Some((_, ids)) => ids.push(child_id),
+                None => groups.push((content_id, vec![child_id])),
+            }
+        }
 
-        let tracker = Box::pin(PropertyTracker::default());
-        // One tracker for both the wrapper attributes and the text emission, so that either
-        // going dirty rebuilds the node.
-        let (node, text_run_nodes) = {
-            let mut text_run_nodes: Vec<(NodeId, Node)> = Vec::new();
-            let node = tracker.as_ref().evaluate(|| {
-                let mut n = self.build_node_without_children(&item, scale_factor, window_position);
-                n.set_children(descendant_children.clone());
-                self.try_emit_text_input_accessibility(
-                    &item,
-                    &mut n,
-                    id,
-                    scale_factor,
-                    window_position,
-                    &mut text_run_nodes,
-                    window_adapter,
-                );
-                n
-            });
-            (node, text_run_nodes)
-        };
+        let mut own_children = Vec::new();
+        for (content_id, ids) in groups {
+            match content_id {
+                Some(content_id) => {
+                    self.build_cached_node(
+                        content_id,
+                        CachedNodeKind::FlickableContent,
+                        base,
+                        ids,
+                        window_position,
+                        scale_factor,
+                        window_adapter,
+                        full,
+                        old,
+                        nodes,
+                    );
+                    own_children.push(content_id);
+                }
+                None => own_children.extend(ids),
+            }
+        }
+        own_children.extend(popup_children);
 
-        // Only the regular descendants: every emit pushes the TextRun children again, and
-        // `accesskit_consumer` rejects a child that appears twice.
-        self.all_nodes.push(CachedNode { id, children: descendant_children, tracker });
-
-        nodes.push((id, node));
-        nodes.extend(text_run_nodes);
+        self.build_cached_node(
+            id,
+            CachedNodeKind::Item,
+            base,
+            own_children,
+            window_position,
+            scale_factor,
+            window_adapter,
+            full,
+            old,
+            nodes,
+        );
 
         id
+    }
+
+    /// Reuses the cache entry for `id` when its place in the tree is unchanged (only what is
+    /// dirty is rebuilt, and nothing is sent when the result is identical), otherwise builds a
+    /// new one. Either way the entry ends up in `all_nodes`.
+    fn build_cached_node(
+        &mut self,
+        id: NodeId,
+        kind: CachedNodeKind,
+        base: Option<NodeId>,
+        children: Vec<NodeId>,
+        window_position: LogicalPoint,
+        scale_factor: ScaleFactor,
+        window_adapter: &std::rc::Rc<WinitWindowAdapter>,
+        full: bool,
+        old: &mut HashMap<NodeId, CachedNode>,
+        nodes: &mut Vec<(NodeId, Node)>,
+    ) {
+        let reusable = if full { None } else { old.remove(&id) };
+        let mut cached = match reusable {
+            Some(c) if c.children == children && c.base == base => c,
+            _ => CachedNode {
+                id,
+                kind,
+                base,
+                children,
+                window_position,
+                tracker: Box::pin(PropertyTracker::default()),
+                geometry_tracker: Box::pin(PropertyTracker::default()),
+                last: None,
+            },
+        };
+        self.refresh_cached_node(&mut cached, scale_factor, window_adapter, nodes);
+        self.all_nodes.push(cached);
+    }
+
+    /// Brings a cache entry up to date and pushes the node to `nodes` if AccessKit has not
+    /// seen this exact node yet. A clean entry costs nothing; a geometry-only change costs a
+    /// geometry read and a compare, and is only sent when the bounds really moved in the
+    /// entry's coordinate space.
+    fn refresh_cached_node(
+        &self,
+        cached: &mut CachedNode,
+        scale_factor: ScaleFactor,
+        window_adapter: &std::rc::Rc<WinitWindowAdapter>,
+        nodes: &mut Vec<(NodeId, Node)>,
+    ) {
+        let base_item = cached
+            .base
+            .and_then(decode_sub_node_id)
+            .and_then(|(flickable_id, _)| self.item_rc_for_node_id(flickable_id));
+        let window_position = cached.window_position;
+        let id = cached.id;
+
+        match cached.kind {
+            CachedNodeKind::FlickableContent => {
+                let Some((flickable_id, _)) = decode_sub_node_id(id) else { return };
+                let Some(flickable) = self.item_rc_for_node_id(flickable_id) else { return };
+                if cached.last.is_some() && !cached.geometry_tracker.is_dirty() {
+                    return;
+                }
+                let transform = cached.geometry_tracker.as_ref().evaluate(|| {
+                    self.flickable_content_transform(
+                        &flickable,
+                        base_item.as_ref(),
+                        scale_factor,
+                        window_position,
+                    )
+                });
+                if cached.last.as_ref().and_then(|n| n.transform()) == Some(&transform) {
+                    return;
+                }
+                let mut node = Node::new(Role::GenericContainer);
+                node.set_transform(transform);
+                node.set_children(cached.children.clone());
+                nodes.push((id, node.clone()));
+                cached.last = Some(node);
+            }
+            CachedNodeKind::Item => {
+                let Some(item) = self.item_rc_for_node_id(id) else { return };
+                if cached.last.is_none() || cached.tracker.is_dirty() {
+                    let mut text_run_nodes: Vec<(NodeId, Node)> = Vec::new();
+                    // One tracker for both the wrapper attributes and the text emission, so
+                    // that either going dirty rebuilds the node.
+                    let mut node = cached.tracker.as_ref().evaluate(|| {
+                        let mut n =
+                            self.build_node_without_children(&item, scale_factor, window_position);
+                        n.set_children(cached.children.clone());
+                        self.try_emit_text_input_accessibility(
+                            &item,
+                            &mut n,
+                            id,
+                            scale_factor,
+                            window_position,
+                            &mut text_run_nodes,
+                            window_adapter,
+                            base_item.as_ref(),
+                        );
+                        n
+                    });
+                    let (bounds, hidden) = cached.geometry_tracker.as_ref().evaluate(|| {
+                        self.item_geometry(&item, base_item.as_ref(), scale_factor, window_position)
+                    });
+                    node.set_bounds(bounds);
+                    if hidden {
+                        node.set_hidden();
+                    }
+                    if cached.last.as_ref() != Some(&node) || !text_run_nodes.is_empty() {
+                        nodes.push((id, node.clone()));
+                        nodes.extend(text_run_nodes);
+                    }
+                    cached.last = Some(node);
+                } else if cached.geometry_tracker.is_dirty() {
+                    let (bounds, hidden) = cached.geometry_tracker.as_ref().evaluate(|| {
+                        self.item_geometry(&item, base_item.as_ref(), scale_factor, window_position)
+                    });
+                    let last = cached.last.as_mut().expect("checked above");
+                    if last.bounds() != Some(bounds) || last.is_hidden() != hidden {
+                        last.set_bounds(bounds);
+                        if hidden {
+                            last.set_hidden();
+                        } else {
+                            last.clear_hidden();
+                        }
+                        nodes.push((id, last.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// `p` (in `item`'s coordinates) in the coordinate space its node is expressed in: the
+    /// content space of the nearest Flickable content node, or the window.
+    fn origin_in_space(
+        &self,
+        item: &ItemRc,
+        p: LogicalPoint,
+        base: Option<&ItemRc>,
+        window_position: LogicalPoint,
+    ) -> LogicalPoint {
+        match base {
+            Some(flickable) => {
+                let (cx, cy) = flickable_content_offset(flickable);
+                let in_flickable = item.map_to_ancestor(p, flickable);
+                LogicalPoint::new(in_flickable.x - cx, in_flickable.y - cy)
+            }
+            None => item.map_to_window(p) + window_position.to_vector(),
+        }
+    }
+
+    /// Bounds of `item` in its node's coordinate space, and whether it is hidden. Reads only
+    /// geometry and visibility, so the geometry tracker stays independent of the content one.
+    fn item_geometry(
+        &self,
+        item: &ItemRc,
+        base: Option<&ItemRc>,
+        scale_factor: ScaleFactor,
+        window_position: LogicalPoint,
+    ) -> (accesskit::Rect, bool) {
+        let geometry = item.geometry();
+        let origin = self.origin_in_space(item, geometry.origin, base, window_position);
+        let physical_origin = (origin * scale_factor).cast::<f64>();
+        let physical_size = (geometry.size * scale_factor).cast::<f64>();
+        (
+            accesskit::Rect {
+                x0: physical_origin.x,
+                y0: physical_origin.y,
+                x1: physical_origin.x + physical_size.width,
+                y1: physical_origin.y + physical_size.height,
+            },
+            !item.is_visible(),
+        )
+    }
+
+    /// The transform of a Flickable's content node: the content origin (the Flickable's origin
+    /// plus its scroll offset), in the coordinate space the Flickable's own node uses.
+    fn flickable_content_transform(
+        &self,
+        flickable: &ItemRc,
+        base: Option<&ItemRc>,
+        scale_factor: ScaleFactor,
+        window_position: LogicalPoint,
+    ) -> Affine {
+        let origin =
+            self.origin_in_space(flickable, LogicalPoint::default(), base, window_position);
+        let (cx, cy) = flickable_content_offset(flickable);
+        let physical = (LogicalPoint::new(origin.x + cx, origin.y + cy) * scale_factor).cast::<f64>();
+        Affine::translate((physical.x, physical.y))
     }
 
     /// Emits the TextRun children of a text input, and the value and selection on `wrapper_node`.
@@ -581,6 +772,7 @@ impl NodeCollection {
         window_position: LogicalPoint,
         text_run_nodes: &mut Vec<(NodeId, Node)>,
         window_adapter: &std::rc::Rc<WinitWindowAdapter>,
+        base: Option<&ItemRc>,
     ) {
         if !wraps_text_input(wrapper_node.role()) {
             return;
@@ -595,7 +787,7 @@ impl NodeCollection {
         // from the wrapper's origin would place every TextRun off by the padding.
         let inner_geometry = inner_item_rc.geometry();
         let inner_absolute_origin =
-            inner_item_rc.map_to_window(inner_geometry.origin) + window_position.to_vector();
+            self.origin_in_space(&inner_item_rc, inner_geometry.origin, base, window_position);
         let physical_origin = (inner_absolute_origin * scale_factor).cast::<f64>();
 
         let mut update =
@@ -632,10 +824,13 @@ impl NodeCollection {
         tree
     }
 
+    /// `full` rebuilds and sends every node (a client just attached); otherwise only nodes
+    /// whose place in the tree, content or geometry changed are rebuilt and sent.
     fn build_new_tree(
         &mut self,
         window_adapter_weak: &Weak<WinitWindowAdapter>,
         property_tracker: Pin<&AccessibilityPropertyTracker>,
+        full: bool,
     ) -> TreeUpdate {
         let Some(window_adapter) = window_adapter_weak.upgrade() else {
             return TreeUpdate {
@@ -678,7 +873,13 @@ impl NodeCollection {
             })
             .collect::<Vec<_>>();
 
-        self.all_nodes.clear();
+        let t0 = std::time::Instant::now();
+        let mut old: HashMap<NodeId, CachedNode> = if full {
+            self.all_nodes.clear();
+            HashMap::new()
+        } else {
+            std::mem::take(&mut self.all_nodes).into_iter().map(|c| (c.id, c)).collect()
+        };
         let mut nodes = Vec::new();
 
         let root_id = property_tracker.evaluate_as_dependency_root(|| {
@@ -689,10 +890,14 @@ impl NodeCollection {
                 ScaleFactor::new(window.scale_factor()),
                 Default::default(),
                 &window_adapter,
+                None,
+                full,
+                &mut old,
             )
         });
         self.root_node_id = root_id;
         self.forget_destroyed_components();
+        stat(if full { "full" } else { "inc" }, nodes.len(), self.all_nodes.len(), t0.elapsed());
 
         TreeUpdate {
             nodes,
@@ -705,8 +910,8 @@ impl NodeCollection {
     fn build_node_without_children(
         &self,
         item: &ItemRc,
-        scale_factor: ScaleFactor,
-        window_position: LogicalPoint,
+        _scale_factor: ScaleFactor,
+        _window_position: LogicalPoint,
     ) -> Node {
         let is_checkable = item
             .accessible_string_property(AccessibleStringProperty::Checkable)
@@ -792,24 +997,10 @@ impl NodeCollection {
             node.set_disabled();
         }
 
-        if !item.is_visible() {
-            node.set_hidden();
-        }
-
         if item.borrow().as_ref().clips_children() {
             node.set_clips_children();
         }
 
-        let geometry = item.geometry();
-        let absolute_origin = item.map_to_window(geometry.origin) + window_position.to_vector();
-        let physical_origin = (absolute_origin * scale_factor).cast::<f64>();
-        let physical_size = (geometry.size * scale_factor).cast::<f64>();
-        node.set_bounds(accesskit::Rect {
-            x0: physical_origin.x,
-            y0: physical_origin.y,
-            x1: physical_origin.x + physical_size.width,
-            y1: physical_origin.y + physical_size.height,
-        });
 
         let is_checked = is_checkable
             && item
@@ -1007,10 +1198,86 @@ impl i_slint_core::properties::PropertyDirtyHandler for DelegateFocusPropertyTra
     }
 }
 
+#[derive(Clone, Copy)]
+enum CachedNodeKind {
+    Item,
+    /// The synthetic node under a Flickable that carries its scroll offset as a transform.
+    FlickableContent,
+}
+
 struct CachedNode {
     id: NodeId,
+    kind: CachedNodeKind,
+    /// The Flickable content node whose coordinate space this node's bounds are in, if any.
+    base: Option<NodeId>,
     children: Vec<NodeId>,
+    window_position: LogicalPoint,
+    /// Everything but geometry: role, label, value, selection, text runs.
     tracker: Pin<Box<PropertyTracker>>,
+    /// Geometry and visibility only. During a scroll only this side goes dirty, and the node
+    /// is re-sent only when its bounds in its own coordinate space actually changed.
+    geometry_tracker: Pin<Box<PropertyTracker>>,
+    /// The node as last sent to AccessKit; `None` until the first build.
+    last: Option<Node>,
+}
+
+/// Debug counters, printed to stderr every second when SLINT_ACCESSKIT_STATS is set.
+#[derive(Default)]
+struct Stats {
+    full: u32,
+    incremental: u32,
+    dirty_passes: u32,
+    nodes_sent: u32,
+    cached: u32,
+    micros: u128,
+    since: Option<std::time::Instant>,
+}
+thread_local! { static STATS: std::cell::RefCell<Option<Stats>> = std::cell::RefCell::new(
+    std::env::var("SLINT_ACCESSKIT_STATS").is_ok().then(Stats::default)); }
+fn stat(kind: &str, nodes_sent: usize, cached: usize, elapsed: std::time::Duration) {
+    STATS.with(|st| {
+        let mut st = st.borrow_mut();
+        let Some(st) = st.as_mut() else { return };
+        match kind { "full" => st.full += 1, "inc" => st.incremental += 1, _ => st.dirty_passes += 1 }
+        st.nodes_sent += nodes_sent as u32;
+        st.cached = cached as u32;
+        st.micros += elapsed.as_micros();
+        let now = std::time::Instant::now();
+        let since = *st.since.get_or_insert(now);
+        if now.duration_since(since) >= std::time::Duration::from_secs(1) {
+            eprintln!("[accesskit] full={} incremental={} dirty={} nodes_sent={} cached={} cpu={:.1}ms",
+                st.full, st.incremental, st.dirty_passes, st.nodes_sent, st.cached, st.micros as f64 / 1000.0);
+            *st = Stats { since: Some(now), ..Default::default() };
+        }
+    });
+}
+
+/// Sub-index of a Flickable's content node, far above anything the TextRun children use.
+const FLICKABLE_CONTENT_SUB_INDEX: u32 = NODE_ID_SUB_INDEX_MASK as u32;
+
+/// The nearest Flickable on the way up from `item` (exclusive) to `ancestor` (inclusive).
+fn nearest_flickable_below(item: &ItemRc, ancestor: &ItemRc) -> Option<ItemRc> {
+    let mut current = item.parent_item(i_slint_core::item_tree::ParentItemTraversalMode::StopAtPopups);
+    while let Some(candidate) = current {
+        if candidate.downcast::<i_slint_core::items::Flickable>().is_some() {
+            return Some(candidate);
+        }
+        if candidate == *ancestor {
+            return None;
+        }
+        current = candidate.parent_item(i_slint_core::item_tree::ParentItemTraversalMode::StopAtPopups);
+    }
+    None
+}
+
+fn flickable_content_offset(flickable: &ItemRc) -> (f32, f32) {
+    flickable
+        .downcast::<i_slint_core::items::Flickable>()
+        .map(|f| {
+            let f = f.as_pin_ref();
+            (f.content_x().0, f.content_y().0)
+        })
+        .unwrap_or_default()
 }
 
 impl From<accesskit_winit::Event> for SlintEvent {
