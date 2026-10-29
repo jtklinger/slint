@@ -370,6 +370,12 @@ fn update_visible_instances(
         if prepend_count > 0 {
             state.offset = new_offset;
         }
+        // Row 0's top is the content's top. The walk back from an anchor estimated for another
+        // model (one longer than this, its offset clamped above) can reach row 0 with room left
+        // above it, which would scroll the content past its top.
+        if new_offset == 0 {
+            new_offset_y = content_y_value;
+        }
         debug_assert!(new_offset >= state.offset && new_offset <= state.offset + ops.len());
 
         // Layout items until we fill the view, starting with already-instantiated ones.
@@ -1121,5 +1127,110 @@ mod ffi {
     ) -> bool {
         let props = TypedListViewProps { content_width, content_height, content_y };
         update_visible_instances(ops, state, row_count, &props, listview_width, listview_height)
+    }
+}
+
+#[cfg(test)]
+mod listview_tests {
+    use super::*;
+    use core::cell::Cell;
+
+    const ROW: Coord = 32 as Coord;
+
+    /// Instances of a fixed height, each remembering the row it shows and where it was laid out.
+    #[derive(Default)]
+    struct FixedRows(Vec<Option<(usize, Cell<Coord>)>>);
+
+    impl RepeaterInstanceOps for FixedRows {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn splice(&mut self, position: usize, remove: usize, add: usize) {
+            self.0.splice(position..position + remove, core::iter::repeat_with(|| None).take(add));
+        }
+        fn ensure_updated(&mut self, instance_idx: usize, row: usize) -> bool {
+            let fresh = self.0[instance_idx].is_none();
+            self.0[instance_idx] = Some((row, Cell::new(0 as Coord)));
+            fresh
+        }
+        fn height(&self, instance_idx: usize) -> Option<Coord> {
+            self.0[instance_idx].as_ref().map(|_| ROW)
+        }
+        fn listview_layout(&self, instance_idx: usize, y: &mut Coord) -> Coord {
+            if let Some((_, at)) = &self.0[instance_idx] {
+                at.set(*y);
+            }
+            *y += ROW;
+            100 as Coord
+        }
+    }
+
+    #[derive(Default)]
+    struct Props {
+        content_y: Cell<Coord>,
+        content_height: Cell<Coord>,
+    }
+
+    impl ListViewProperties for Props {
+        fn content_y_get(&self) -> LogicalLength {
+            LogicalLength::new(self.content_y.get())
+        }
+        fn content_y_get_internal(&self) -> LogicalLength {
+            self.content_y_get()
+        }
+        fn content_y_set(&self, value: LogicalLength) {
+            self.content_y.set(value.get());
+        }
+        fn content_y_has_binding(&self) -> bool {
+            false
+        }
+        fn computes_content_height(&self) -> bool {
+            true
+        }
+        fn content_width_set(&self, _: LogicalLength) {}
+        fn content_height_set(&self, value: LogicalLength) {
+            self.content_height.set(value.get());
+        }
+        fn register_as_dependencies(&self) {}
+    }
+
+    fn layout(ops: &mut FixedRows, state: &mut RepeaterLayoutState, rows: usize, props: &Props) {
+        let height = LogicalLength::new(836 as Coord);
+        update_visible_instances(ops, state, rows, props, LogicalLength::new(500 as Coord), height);
+    }
+
+    /// The first row shown, and where it was laid out.
+    fn first(ops: &FixedRows) -> (usize, Coord) {
+        let (row, at) = ops.0[0].as_ref().unwrap();
+        (*row, at.get())
+    }
+
+    #[test]
+    fn a_shorter_model_at_the_top_starts_at_the_top() {
+        // A list of 128 rows scrolled 360 px down, as a file manager's folder can be.
+        let (mut ops, mut state, props) = (FixedRows::default(), RepeaterLayoutState::default(), Props::default());
+        layout(&mut ops, &mut state, 128, &props);
+        props.content_y.set(-360 as Coord);
+        layout(&mut ops, &mut state, 128, &props);
+        assert_eq!(state.offset, 11);
+        // Another folder: the scroll back to the top, and a model of 4 rows, fewer than the
+        // rows scrolled past.
+        props.content_y.set(0 as Coord);
+        layout(&mut ops, &mut state, 4, &props);
+        assert_eq!(props.content_y.get(), 0 as Coord, "the scroll stays at the top");
+        assert_eq!(first(&ops), (0, 0 as Coord), "row 0 at the top of the viewport");
+        assert_eq!(props.content_height.get(), 4 as Coord * ROW);
+    }
+
+    #[test]
+    fn scrolling_up_to_the_top_keeps_row_zero_at_the_top() {
+        let (mut ops, mut state, props) = (FixedRows::default(), RepeaterLayoutState::default(), Props::default());
+        layout(&mut ops, &mut state, 128, &props);
+        props.content_y.set(-360 as Coord);
+        layout(&mut ops, &mut state, 128, &props);
+        props.content_y.set(0 as Coord);
+        layout(&mut ops, &mut state, 128, &props);
+        assert_eq!(props.content_y.get(), 0 as Coord);
+        assert_eq!(first(&ops), (0, 0 as Coord));
     }
 }
